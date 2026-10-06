@@ -163,8 +163,8 @@ async function loadWithEngine(bytes) {
     if (!extract) throw new Error('The PDF engine does not expose page text extraction.');
     loadedDocument.pages = await Promise.all(Array.from({ length: count }, async (_, index) => {
       const page = await extract.call(engine, loadedDocument, index);
-      const viewport = page.page?.getViewport?.({ scale: 1 });
-      return { ...page, textContent: page.content, width: viewport?.width || 612, height: viewport?.height || 792, viewport };
+      const viewport = page.page?.getViewport?.({ scale: 1 }) || page.viewport;
+      return { ...page, textContent: page.content, width: viewport?.width || page.width || 612, height: viewport?.height || page.height || 792, viewport };
     }));
   }
   return { document: loadedDocument, result, bytes: copyBytes(bytes), warnings: [...new Set([...detection.warnings, ...(result?.warnings || [])])] };
@@ -176,7 +176,7 @@ async function renderWithEngine(pageIndex, scale = 1, withText = true) {
   const method = findEngineFunction(['renderPage', 'render']);
   if (method?.length >= 4 || (source?.pdf && method)) {
     const canvas = document.createElement('canvas');
-    const layer = withText ? document.createElement('div') : null;
+    const layer = withText && source?.pdf ? document.createElement('div') : null;
     if (layer) { layer.className = 'pdf-text-layer textLayer'; layer.style.setProperty('--scale-factor', String(scale)); layer.style.setProperty('--total-scale-factor', String(scale)); }
     const output = await method.call(engine, source, pageIndex, canvas, layer, scale);
     if (layer) decorateTextLayer(layer, output.textContent || docPage().enginePage.content);
@@ -228,16 +228,18 @@ async function applyWithEngine(edit) {
     const selectedNode = $('#paper [data-start="' + state.selected.start + '"]');
     const style = selectedNode ? getComputedStyle(selectedNode.parentElement) : null;
     payload.fontSize = parseFloat(style?.fontSize) || 11;
+    payload.reflow = edit.action === 'replace';
     if (edit.action === 'add') {
       const rect = rects[0];
       const availableWidth = Math.max(40, edit.value.length * payload.fontSize * 0.55);
       const left = edit.position === 'after' ? rect[2] + 2 : Math.max(0, rect[0] - availableWidth - 2);
       payload.rects = [[left, rect[1], Math.min(docPage().width, left + availableWidth), rect[3] + 3]];
     } else if (edit.action === 'replace') {
-      const removed = await method.call(engine, copyBytes(state.sourceBytes), { ...payload, action: 'remove' });
-      const first = rects[0];
-      const lineEnd = Math.max(...rects.filter((rect) => Math.abs(rect[1] - first[1]) < 3).map((rect) => rect[2]));
-      return method.call(engine, extractBytes(removed), { ...payload, action: 'add', rects: [[first[0], first[1], Math.max(first[0] + 16, lineEnd), first[3] + 3]] });
+      // Keep replacement atomic: MuPDF redacts the selected glyphs and bakes
+      // the replacement in the same document operation. The old two-pass
+      // remove-then-add flow could leave a visible source glyph behind when
+      // an annotation save raced the second pass.
+      return method.call(engine, copyBytes(state.sourceBytes), payload);
     } else if (edit.action === 'remove' && edit.gap === 'close') {
       // Reflow the trailing text in the selected PDF.js text item, which is
       // the smallest reliable line boundary exposed by the native engine.
@@ -283,6 +285,9 @@ function decorateTextLayer(layer, content) {
 }
 
 function selectionRects(selection = state.selected) {
+  if (!state.engineDocument?.pdf) {
+    return docPage().words.filter((word) => word.end > selection.start && word.start < selection.end && Number.isFinite(word.x)).map((word) => [word.x, word.y, word.x + word.width, word.y + word.height]);
+  }
   const layer = $('#paper .pdf-text-layer');
   const pageNode = $('#paper .pdf-page');
   if (!layer || !pageNode) return [];
@@ -307,7 +312,7 @@ function renderTextLayer(page) {
   if (!hasGeometry) return `<div class="pdf-text-fallback">${wrapWords(page.text, 0)}</div>`;
   return `<div class="pdf-text-layer" aria-label="PDF text">${page.words.map((word) => {
     const active = word.start < state.selected.end && word.end > state.selected.start;
-    return `<span class="pdf-word${active ? ' pdf-selection' : ''}" data-start="${word.start}" data-end="${word.end}" style="left:${word.x}px;top:${word.y}px;width:${word.width}px;height:${word.height}px">${safe(word.text)}</span>`;
+    return `<span class="pdf-word${active ? ' pdf-selection' : ''}" data-start="${word.start}" data-end="${word.end}" style="left:${word.x / page.width * 100}%;top:${word.y / page.height * 100}%;width:${word.width / page.width * 100}%;height:${word.height / page.height * 100}%">${safe(word.text)}</span>`;
   }).join('')}</div>`;
 }
 
@@ -355,7 +360,7 @@ function renderActionForm(selected, fit, pending) {
   if (pending) return `<div class="pending-card"><div class="pending-icon">${pending.action === 'remove' ? icon('eye-off') : icon('sparkles')}</div><div><span class="eyebrow">LIVE PREVIEW</span><h3>${pending.action === 'remove' ? 'Text marked for removal' : 'Replacement looks ready'}</h3></div><p>${pending.action === 'remove' ? 'The selected characters will be removed from the PDF content stream.' : `“${safe(pending.value)}” will inherit the surrounding style.`}</p><div class="pending-actions"><button class="cancel-button" id="cancel-preview">Cancel</button><button class="confirm-button" id="confirm-preview">Confirm edit ${icon('arrow')}</button></div></div>`;
   if (state.action === 'remove') return `<div class="form-section"><label class="field-label">REMOVE TEXT</label><div class="remove-preview">${safe(selected)}<span>${icon('eye-off')} Will be deleted from page content</span></div><label class="radio-row"><input type="radio" name="gap" value="blank" ${state.gap === 'blank' ? 'checked' : ''}><span class="radio-mark"></span><span>Leave blank <small>Preserve the original spacing</small></span></label><label class="radio-row"><input type="radio" name="gap" value="close" ${state.gap === 'close' ? 'checked' : ''}><span class="radio-mark"></span><span>Close the gap <small>Pull the surrounding text together</small></span></label></div><div class="warning-box">${icon('shield')} <span><b>Permanent removal</b><br />The text will be removed from the PDF content stream, not covered with a white shape.</span></div><button class="confirm-button" id="preview">Preview removal ${icon('arrow')}</button>`;
   const label = state.action === 'add' ? 'TEXT TO INSERT' : 'REPLACE WITH';
-  return `<div class="form-section"><label class="field-label" for="replacement">${label}</label><textarea id="replacement" rows="2" spellcheck="false">${safe(state.replacement)}</textarea>${state.action === 'add' ? `<div class="position-toggle"><button class="${state.addPosition === 'before' ? 'active' : ''}" data-position="before">Insert before</button><button class="${state.addPosition === 'after' ? 'active' : ''}" data-position="after">Insert after</button></div>` : ''}<div class="fit-row">${icon('sparkles')}<span>Fit to original style</span><b>${fit.label}</b></div></div>${fit.warning ? `<div class="warning-box amber">${icon('alert')} <span><b>Text may overflow</b><br />The engine will preserve the source content stream and report any fit warning.</span></div>` : ''}<button class="confirm-button" id="preview">Preview ${state.action} ${icon('arrow')}</button>`;
+   return `<div class="form-section"><label class="field-label" for="replacement">${label}</label><textarea id="replacement" rows="2" spellcheck="false">${safe(state.replacement)}</textarea>${state.action === 'add' ? `<div class="position-toggle"><button class="${state.addPosition === 'before' ? 'active' : ''}" data-position="before">Insert before</button><button class="${state.addPosition === 'after' ? 'active' : ''}" data-position="after">Insert after</button></div>` : ''}<div class="fit-row">${icon('sparkles')}<span>Fit to original style</span><b>${fit.label}</b></div></div>${fit.warning ? `<div class="warning-box amber">${icon('alert')} <span><b>Text may overflow</b><br />Following words will reflow within the affected text block.</span></div>` : ''}<button class="confirm-button" id="preview">Preview ${state.action} ${icon('arrow')}</button>`;
 }
 
 function bindEvents() {

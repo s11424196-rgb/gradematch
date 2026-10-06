@@ -57,7 +57,8 @@ export function makePdf(document) {
     for (const line of lines.slice(3)) { commands.push(`(${pdfEscape(line.trim())}) Tj`, '0 -19 Td'); }
     commands.push('ET');
     const content = commands.join('\n');
-    contentIds.push(add(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`));
+    // The stream body includes the newline immediately before endstream.
+    contentIds.push(add(`<< /Length ${content.length + 1} >>\nstream\n${content}\nendstream`));
     pageIds.push(add('PLACEHOLDER'));
   }
   const pagesId = add('PLACEHOLDER');

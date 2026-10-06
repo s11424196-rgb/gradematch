@@ -36,7 +36,11 @@ function loadPdfJs() {
 
 function loadMupdf() {
   if (!mupdfPromise) {
-    mupdfPromise = import(isBrowser() ? MUPDF_BROWSER_MODULE : 'mupdf').then((module) => module.default || module);
+    mupdfPromise = import(isBrowser() ? MUPDF_BROWSER_MODULE : 'mupdf').then((module) => {
+      const runtime = module.default || module;
+      globalThis.__paperlineMupdf = runtime;
+      return runtime;
+    });
   }
   return mupdfPromise;
 }
@@ -67,37 +71,92 @@ function passwordError(error) {
 /** Load a PDF.js document. `options.password` is optional for encrypted PDFs. */
 export async function loadPdf(bytes, options = {}) {
   const data = normalizePdfBytes(bytes);
-  const pdfjs = await loadPdfJs();
-  const loadingTask = pdfjs.getDocument({
-    // PDF.js can transfer/detach its input to the worker. Retain our own copy
-    // for undo, export, and subsequent MuPDF mutations.
-    data: new Uint8Array(data),
-    password: options.password,
-    useWorkerFetch: options.useWorkerFetch,
-    isEvalSupported: options.isEvalSupported,
-    ...(isBrowser() ? {
-      cMapUrl: '/node_modules/pdfjs-dist/cmaps/',
-      cMapPacked: true,
-      standardFontDataUrl: '/node_modules/pdfjs-dist/standard_fonts/',
-      wasmUrl: '/node_modules/pdfjs-dist/wasm/',
-    } : {}),
-  });
+  // MuPDF is the primary browser reader because it gives us the same page
+  // geometry and text extraction primitives used by the writer. PDF.js stays
+  // as a fallback for environments where the WASM runtime is unavailable.
   try {
-    const pdf = await loadingTask.promise;
+    const mupdf = await loadMupdf();
+    const mupdfDocument = openMupdfDocument(mupdf, data, options);
     return {
-      pdf,
+      mupdfDocument,
       bytes: data,
-      pageCount: pdf.numPages,
-      getPageText: (pageIndex) => getPageText(pdf, pageIndex),
-      destroy: async () => {
-        await pdf.cleanup?.();
-        await loadingTask.destroy?.();
-      },
+      pageCount: mupdfDocument.countPages(),
+      getPageText: (pageIndex) => getMupdfPageText(mupdfDocument, pageIndex),
+      destroy: async () => mupdfDocument.destroy(),
     };
-  } catch (error) {
-    try { await loadingTask.destroy(); } catch { /* The original error is more useful. */ }
-    throw passwordError(error);
+  } catch (mupdfError) {
+    const pdfjs = await loadPdfJs();
+    const loadingTask = pdfjs.getDocument({
+      data: new Uint8Array(data),
+      password: options.password,
+      useWorkerFetch: options.useWorkerFetch,
+      isEvalSupported: options.isEvalSupported,
+      ...(isBrowser() ? {
+        cMapUrl: '/node_modules/pdfjs-dist/cmaps/',
+        cMapPacked: true,
+        standardFontDataUrl: '/node_modules/pdfjs-dist/standard_fonts/',
+        wasmUrl: '/node_modules/pdfjs-dist/wasm/',
+      } : {}),
+    });
+    try {
+      const pdf = await loadingTask.promise;
+      return {
+        pdf,
+        bytes: data,
+        pageCount: pdf.numPages,
+        getPageText: (pageIndex) => getPageText(pdf, pageIndex),
+        destroy: async () => { await pdf.cleanup?.(); await loadingTask.destroy?.(); },
+      };
+    } catch (pdfjsError) {
+      try { await loadingTask.destroy(); } catch { /* The original error is more useful. */ }
+      throw passwordError(pdfjsError) || passwordError(mupdfError);
+    }
   }
+}
+
+function openMupdfDocument(mupdf, bytes, options = {}) {
+  let doc;
+  try { doc = mupdf.Document.openDocument(bytes, 'application/pdf'); }
+  catch (error) { throw passwordError(error) || new PdfEngineError('The file could not be opened as a valid PDF.', 'INVALID_PDF', error); }
+  if (doc.needsPassword()) {
+    if (!options.password) { doc.destroy(); throw new PdfEngineError('This PDF is password-protected. Supply a password to open it.', 'PASSWORD_REQUIRED'); }
+    if (!doc.authenticatePassword(options.password)) { doc.destroy(); throw new PdfEngineError('The PDF password is incorrect.', 'PASSWORD_INVALID'); }
+  }
+  if (!doc.isPDF()) { doc.destroy(); throw new PdfEngineError('The file is not a PDF document.', 'INVALID_PDF'); }
+  return doc;
+}
+
+function mupdfPageContent(page) {
+  const parsed = JSON.parse(page.toStructuredText({}).asJSON(1));
+  const items = [];
+  const blocks = [];
+  let offset = 0;
+  for (const block of parsed.blocks || []) {
+    if (block.type !== 'text') continue;
+    const lines = [];
+    for (const line of block.lines || []) {
+      const text = String(line.text || '');
+      if (!text) continue;
+      const bbox = line.bbox || {};
+      const x = Number(bbox.x ?? line.x ?? 0);
+      const y = Number(bbox.y ?? line.y ?? 0);
+      const right = x + Number(bbox.w ?? Math.max(1, text.length * 6));
+      const bottom = y + Number(bbox.h ?? line.font?.size ?? 11);
+      const item = { str: text, hasEOL: true, x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y), fontName: line.font?.name || 'Helvetica', start: offset, rect: [x, y, right, bottom], fontSize: Number(line.font?.size) || 11 };
+      items.push(item); lines.push(item); offset += text.length + 1;
+    }
+    if (lines.length) blocks.push({ start: lines[0].start, end: lines.at(-1).start + lines.at(-1).str.length, text: lines.map((line) => line.str).join('\n'), lines, rect: [Math.min(...lines.map((line) => line.rect[0])), Math.min(...lines.map((line) => line.rect[1])), Math.max(...lines.map((line) => line.rect[2])), Math.max(...lines.map((line) => line.rect[3]))], fontSize: lines[0].fontSize });
+  }
+  return { items, blocks, styles: {} };
+}
+
+function getMupdfPageText(doc, pageIndex) {
+  if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= doc.countPages()) throw new RangeError('Invalid PDF page index.');
+  const page = doc.loadPage(pageIndex);
+  const bounds = page.getBounds();
+  const content = mupdfPageContent(page);
+  const text = textContentToText(content);
+  return { pageIndex, page, content, items: content.items, text, width: bounds[2] - bounds[0], height: bounds[3] - bounds[1], viewport: { scale: 1, width: bounds[2] - bounds[0], height: bounds[3] - bounds[1] } };
 }
 
 function pageFromEngine(engine, pageIndex) {
@@ -112,6 +171,7 @@ function pageFromEngine(engine, pageIndex) {
 export async function renderPage(engine, pageIndex, canvas, textLayer, scale = 1) {
   if (!canvas?.getContext) throw new TypeError('renderPage requires a canvas element.');
   if (!Number.isFinite(scale) || scale <= 0) throw new RangeError('PDF render scale must be greater than zero.');
+  if (engine?.mupdfDocument) return renderMupdfPage(engine.mupdfDocument, pageIndex, canvas, scale);
   const page = await pageFromEngine(engine, pageIndex);
   const viewport = page.getViewport({ scale: Number(scale) || 1 });
   const context = canvas.getContext('2d');
@@ -146,6 +206,25 @@ export async function renderPage(engine, pageIndex, canvas, textLayer, scale = 1
   }
   await renderTask.promise;
   return { page, viewport, textContent, text: textContentToText(textContent) };
+}
+
+function renderMupdfPage(doc, pageIndex, canvas, scale) {
+  const mupdf = globalThis.__paperlineMupdf;
+  if (!mupdf) throw new PdfEngineError('The MuPDF runtime is not ready.', 'MUPDF_NOT_READY');
+  const page = doc.loadPage(pageIndex);
+  const bounds = page.getBounds();
+  const pixmap = page.toPixmap(mupdf.Matrix.scale(scale, scale), mupdf.ColorSpace.DeviceRGB, false);
+  const width = pixmap.getWidth();
+  const height = pixmap.getHeight();
+  canvas.width = width; canvas.height = height; canvas.style.width = `${bounds[2] - bounds[0]}px`; canvas.style.height = `${bounds[3] - bounds[1]}px`;
+  const pixels = pixmap.getPixels();
+  const components = pixmap.getNumberOfComponents();
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  for (let source = 0, target = 0; target < rgba.length; target += 4) {
+    rgba[target] = pixels[source++] || 255; rgba[target + 1] = pixels[source++] || 255; rgba[target + 2] = pixels[source++] || 255; rgba[target + 3] = components > 3 ? pixels[source++] : 255;
+  }
+  canvas.getContext('2d').putImageData(new ImageData(rgba, width, height), 0, 0);
+  return { canvas, viewport: { scale, width: bounds[2] - bounds[0], height: bounds[3] - bounds[1] }, text: mupdfPageContent(page) };
 }
 
 function prepareTextLayer(container, viewport) {
@@ -198,6 +277,7 @@ export function textContentToText(textContent) {
 
 /** Extract one zero-based page's text and its PDF.js content items. */
 export async function getPageText(engineOrPdf, pageIndex) {
+  if (engineOrPdf?.mupdfDocument) return getMupdfPageText(engineOrPdf.mupdfDocument, pageIndex);
   const pdf = engineOrPdf?.pdf || engineOrPdf;
   if (!pdf?.getPage) throw new TypeError('Expected a PDF.js document or engine.');
   if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= pdf.numPages) throw new RangeError('Invalid PDF page index.');
@@ -209,6 +289,12 @@ export async function getPageText(engineOrPdf, pageIndex) {
 export const extractPageText = getPageText;
 
 function itemPoints(item, start = 0, end = item.str?.length || 0, style = {}) {
+  if (!item.transform && Number.isFinite(item.x) && Number.isFinite(item.y)) {
+    const length = Math.max(1, item.str?.length || 0);
+    const width = Math.max(1, Number(item.width) || length * 6);
+    const height = Math.max(1, Number(item.height) || 11);
+    return [[item.x + width * start / length, item.y], [item.x + width * end / length, item.y], [item.x + width * start / length, item.y + height], [item.x + width * end / length, item.y + height]];
+  }
   const [a, b, c, d, x, y] = item.transform || [1, 0, 0, 1, 0, 0];
   const length = Math.max(1, item.str?.length || 0);
   const advance = Math.hypot(a, b) || 1;
@@ -354,6 +440,28 @@ function addFreeText(page, rect, value, edit) {
   return annotation;
 }
 
+function freeTextFontAlias(name = '') {
+  const font = String(name).toLowerCase();
+  const bold = /bold|black|heavy/.test(font);
+  const italic = /italic|oblique/.test(font);
+  if (/courier|mono/.test(font)) return bold && italic ? 'CoBI' : bold ? 'CoBo' : italic ? 'CoIt' : 'Cour';
+  if (/times|serif|cambria|georgia/.test(font)) return `Ti${bold ? 'Bo' : italic ? 'It' : 'Ro'}`;
+  return `He${bold && italic ? 'BI' : bold ? 'Bo' : italic ? 'It' : 'lv'}`;
+}
+
+function reflowBlockForEdit(page, edit) {
+  const content = mupdfPageContent(page);
+  const original = String(edit.original || edit.selectedText || '');
+  const start = Number.isInteger(edit.start) ? edit.start : content.items.map((item) => item.str).join('\n').indexOf(original);
+  const end = Number.isInteger(edit.end) ? edit.end : start + original.length;
+  const block = content.blocks.find((candidate) => candidate.start < end && candidate.end > start);
+  if (!block || start < block.start || end > block.end) return null;
+  const localStart = start - block.start;
+  const localEnd = end - block.start;
+  const text = block.text.slice(0, localStart) + String(edit.value ?? '') + block.text.slice(localEnd);
+  return { ...block, text };
+}
+
 function makeRedaction(page, rect) {
   const annotation = page.createAnnotation('Redact');
   annotation.setRect(rect);
@@ -432,7 +540,8 @@ export async function applyPdfEdit(bytes, edit = {}) {
     const pageIndex = Number.isInteger(edit.pageIndex) ? edit.pageIndex : (Number.isInteger(edit.page) ? edit.page : 0);
     if (pageIndex < 0 || pageIndex >= doc.countPages()) throw new RangeError('Invalid PDF page index.');
     page = doc.loadPage(pageIndex);
-    const rects = editRects(edit, page);
+    const reflow = edit.action === 'replace' && edit.reflow !== false ? reflowBlockForEdit(page, edit) : null;
+    const rects = reflow ? reflow.lines.map((line) => line.rect) : editRects(edit, page);
     if (edit.action === 'remove' || edit.action === 'replace') {
       for (const rect of rects) {
         const redaction = makeRedaction(page, rect);
@@ -445,15 +554,30 @@ export async function applyPdfEdit(bytes, edit = {}) {
     if (edit.action === 'add' || edit.action === 'replace') {
       const value = edit.value ?? edit.text;
       if (!String(value ?? '').length) throw new TypeError('A replacement/addition edit needs text.');
-      // One annotation for the selection (not one duplicate per selected word).
+      // One annotation for the selection/block (not one duplicate per word).
       let rect = unionRects(rects);
+      const originalLength = String(edit.original || edit.selectedText || '').length;
+      const annotationValue = reflow ? reflow.text : value;
+      const annotationEdit = reflow ? { ...edit, value: annotationValue, fontSize: Number(edit.fontSize) || reflow.fontSize, fontName: edit.fontName || freeTextFontAlias(reflow.lines[0].fontName) } : edit;
+      if (reflow) {
+        const pageBounds = page.getBounds();
+        const lineHeight = Math.max(12, reflow.lines[0].height * 1.35);
+        const availableWidth = Math.max(1, pageBounds[2] - reflow.rect[0] - 8);
+        const averageCharacterWidth = Math.max(3, reflow.rect[2] - reflow.rect[0]) / Math.max(1, reflow.lines.map((line) => line.str.length).reduce((a, b) => Math.max(a, b), 1));
+        const estimatedLines = Math.max(reflow.lines.length, Math.ceil(annotationValue.length * averageCharacterWidth / availableWidth));
+        rect = [reflow.rect[0], reflow.rect[1], pageBounds[2] - 4, Math.min(pageBounds[3] - 4, reflow.rect[1] + estimatedLines * lineHeight + 4)];
+      } else if (edit.action === 'replace') {
+        const width = Math.max(rect[2] - rect[0] + 12, (rect[2] - rect[0]) * (String(value).length / Math.max(1, originalLength)) + 12);
+        const pageBounds = page.getBounds();
+        rect = [rect[0], rect[1], Math.min(pageBounds[2], rect[0] + width), rect[3]];
+      }
       if (edit.action === 'add' && edit.position) {
         const width = Number(edit.width) || Math.max(rect[2] - rect[0], String(value).length * (Number(edit.fontSize) || 11) * 0.6);
         rect = edit.position === 'after'
           ? [rect[2], rect[1], rect[2] + width, rect[3]]
           : [rect[0] - width, rect[1], rect[0], rect[3]];
       }
-      const annotation = addFreeText(page, rect, value, edit);
+      const annotation = addFreeText(page, rect, annotationValue, annotationEdit);
       bakeFreeText(doc, pageIndex, [annotation]);
       annotation.destroy();
     }
