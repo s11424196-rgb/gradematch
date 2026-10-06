@@ -1,0 +1,25 @@
+<!doctype html><html><head><title>GradeMatch browser checks</title><link rel="stylesheet" href="/src/style.css"></head><body><pre id="results">Running…</pre><div id="app"></div><script type="module">
+import {loadPhoto,exportJpeg,samplePhoto} from '/src/imaging.js';
+import {applyTransform,DEFAULT_SETTINGS} from '/src/color.js';
+import {renderGPU} from '/src/webgl.js';
+await import('/src/main.js');
+const results=[];const check=(name,condition)=>{results.push({name,pass:!!condition});document.querySelector('#results').textContent=JSON.stringify(results,null,2);if(!condition)throw Error(name)};
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+try{
+const doc=document,w=window;for(let n=0;n<100&&(!doc.querySelector('#match-state')||doc.querySelector('#match-state').textContent!=='Look matched');n++)await wait(100);if(!doc.querySelector('#match-state'))throw Error('GradeMatch app did not load');
+check('Demo loads and automatically matches',doc.querySelector('#match-state').textContent==='Look matched');
+check('Preview canvas rendered',doc.querySelector('#graded').width>500);
+doc.querySelector('[data-view="after"]').click();check('After-only mode works',doc.querySelector('#preview-image').classList.contains('after-only'));
+doc.querySelector('[data-view="split"]').click();check('Comparison mode works',!doc.querySelector('#preview-image').classList.contains('after-only'));
+const slider=doc.querySelector('#exposure');const original=slider.value;slider.value=2;slider.dispatchEvent(new w.Event('input',{bubbles:true}));check('Editable slider updates value',doc.querySelector('#exposure-value').textContent==='+2.00');doc.querySelector('#reset-button').click();check('Reset restores extracted settings',slider.value===original);
+doc.querySelector('#how-button').click();check('Help opens',doc.querySelector('dialog').open);doc.querySelector('.dialog-close').click();
+const photo=await loadPhoto('/images/alpine.jpg');const jpeg=await exportJpeg(photo,DEFAULT_SETTINGS);const decoded=await createImageBitmap(jpeg);check('Full-resolution JPEG export',jpeg.type==='image/jpeg'&&decoded.width===photo.width&&decoded.height===photo.height);decoded.close();
+let rejected=false;try{await loadPhoto(new File(['bad'],'bad.txt',{type:'text/plain'}))}catch{rejected=true}check('Invalid file rejected',rejected);
+rejected=false;try{await loadPhoto(new File([new Uint8Array(30*1024*1024+1)],'large.jpg',{type:'image/jpeg'}))}catch{rejected=true}check('Oversized file rejected',rejected);
+const settings={...DEFAULT_SETTINGS,temperature:20,tint:-10,contrast:15,saturation:15,exposure:.2};const canvas=document.createElement('canvas');const start=performance.now();const gpu=renderGPU(canvas,photo,settings,400);const ms=performance.now()-start;check('WebGL preview available',gpu);const cpu=applyTransform(samplePhoto(photo,400),settings).data;const actual=canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data;let sum=0,max=0;for(let i=0;i<cpu.length;i++){if(i%4===3)continue;const delta=Math.abs(cpu[i]-actual[i]);sum+=delta;max=Math.max(max,delta)}const mean=sum/(cpu.length*.75);check('GPU / CPU mean difference < 2 channel levels',mean<2);results.push({GPU_first_render_ms:Math.round(ms),GPU_CPU_mean_error:mean,GPU_CPU_max_error:max});
+const downloads=[];w.HTMLAnchorElement.prototype.click=function(){downloads.push(this.download)};doc.querySelector('#lut-button').click();for(let n=0;n<30&&!downloads.length;n++)await wait(100);check('LUT export button downloads cube',downloads.some(x=>x.endsWith('.cube')));
+document.body.style.width='390px';await wait(150);check('Mobile layout has no horizontal overflow',doc.documentElement.scrollWidth<=doc.documentElement.clientWidth);
+results.push({status:'ALL PASSED'});
+}catch(e){results.push({error:e.message,status:'FAILED'})}
+document.querySelector('#results').textContent=JSON.stringify(results,null,2);document.body.dataset.done='true';
+</script></body></html>
