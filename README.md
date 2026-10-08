@@ -1,27 +1,25 @@
-# Paperline
+# GradeMatch
 
-A browser-first PDF text editor based on the supplied PRD. PDF.js provides the selectable text model and MuPDF.js provides local rendering, redaction, annotation baking, and export.
+GradeMatch is a responsive, local-only photo matcher. Load a reference photo and a target photo, estimate a matching look in the browser, fine-tune the tone and colour controls, and export either a full-resolution JPG or a standard `.cube` LUT.
 
 ## Run
 
-Requires Node 20 or newer.
+Requires Node 20 or newer. The application has no runtime dependencies.
 
 ```sh
-npm install
 npm run dev        # http://localhost:5173
-npm test           # core editor and existing unit tests
+npm test           # colour engine tests
 npm run build      # static output in dist/
 npm run preview    # serve dist/ locally
 ```
 
-## Included MVP flow
+## Included flow
 
-- Three-page demo agreement with page thumbnails and local-only status.
-- Word-boundary selection snapping, replace/remove/add actions, and live preview.
-- Remove mode distinguishes a real content removal from a visual white overlay.
-- Fit warnings for longer replacements, affected-block reflow, and style-match status in the inspector.
-- Confirm/cancel, undo/redo, zoom controls, imported-PDF validation, and PDF export.
-- No accounts, uploads, analytics, or runtime processing service.
-- PDF.js and MuPDF runtime assets are copied into `dist/` for static hosting.
+- Local demo images load and match automatically.
+- Reference and target JPG, PNG, and WebP uploads are validated in the browser.
+- Before, split, and after preview modes include an adjustable comparison divider.
+- Exposure, contrast, highlights, shadows, whites, blacks, temperature, tint, saturation, strength, and skin-protection controls are editable live.
+- Reset restores the extracted match, while help and privacy dialogs explain the workflow.
+- JPG and 33-point `.cube` exports are generated locally; no account, upload, analytics, or processing service is used.
 
-Confirmed remove edits use MuPDF redaction and are re-extracted for verification; replace/add edits use baked FreeText with automatic fit warnings. OCR, complex-script layout, and deep font-substitution matching remain intentionally limited to the MVP boundary.
+The build copies only `index.html`, `src/`, and the local `public/` image/font assets into `dist/`. No PDF engine or PDF runtime assets are required.
