@@ -17,7 +17,6 @@ function loadImage(url) {
 /**
  * Decode on this device. File object URLs stay valid for thumbnails; the caller
  * should revoke photo.url and close photo.image (if supported) when replacing it.
- * Modern HTML image decoding is the EXIF-aware fallback for createImageBitmap.
  */
 export async function loadPhoto(fileOrUrl) {
   const isFile = typeof File !== 'undefined' && fileOrUrl instanceof File;
@@ -54,7 +53,6 @@ export async function loadPhoto(fileOrUrl) {
       try {
         image = await createImageBitmap(fileOrUrl, { imageOrientation: 'from-image' });
       } catch {
-        // Some browsers support bitmap decoding for fewer formats than <img>.
         image = await loadImage(url);
       }
     } else {
@@ -105,7 +103,7 @@ function drawPreview(canvas, photo, maxDimension) {
   return context;
 }
 
-/** Unmodified, aspect-preserving pixels for image analysis; never upscales. */
+/** Unmodified, aspect-preserving pixels for image analysis; never upsamples. */
 export function samplePhoto(photo, maxDimension = 400) {
   const canvas = document.createElement('canvas');
   try {
@@ -128,16 +126,15 @@ export function renderPhoto(canvas, photo, settings = {}, maxDimension = 1600) {
 const yieldToBrowser = () => new Promise(resolve => setTimeout(resolve, 0));
 
 /**
- * Export original oriented dimensions, not preview dimensions. Pixel processing
- * yields between strips. JPEG encoding and the full output canvas still require
- * browser memory; transparent pixels are composited on white after grading.
+ * Export original oriented dimensions. Uses vertical strip translation 
+ * instead of source-rect cropping to safely support EXIF-oriented images.
  */
 export async function exportJpeg(photo, settings = {}) {
   const { width, height } = dimensions(photo, Math.max(photo?.width || 0, photo?.height || 0));
-  // Freeze the settings so adjustments made during export cannot create seams.
   const exportSettings = typeof structuredClone === 'function'
     ? structuredClone(settings)
     : JSON.parse(JSON.stringify(settings));
+  
   const output = document.createElement('canvas');
   const strip = document.createElement('canvas');
   try {
@@ -147,6 +144,7 @@ export async function exportJpeg(photo, settings = {}) {
     const outputContext = context2d(output);
     outputContext.fillStyle = '#fff';
     outputContext.fillRect(0, 0, width, height);
+
     const stripHeight = Math.max(1, Math.min(256, Math.floor(262144 / width)));
     strip.width = width;
     strip.height = stripHeight;
@@ -155,7 +153,10 @@ export async function exportJpeg(photo, settings = {}) {
     for (let y = 0; y < height; y += stripHeight) {
       const rows = Math.min(stripHeight, height - y);
       stripContext.clearRect(0, 0, width, stripHeight);
-      stripContext.drawImage(photo.image, 0, y, width, rows, 0, 0, width, rows);
+      
+      // Draw shifted by -y to avoid source-rect incompatibilities with EXIF image orientation
+      stripContext.drawImage(photo.image, 0, -y, width, height);
+      
       const pixels = stripContext.getImageData(0, 0, width, rows);
       const transformed = applyTransform(pixels, exportSettings);
       stripContext.putImageData(transformed || pixels, 0, 0);
@@ -188,7 +189,6 @@ export function downloadBlob(blob, filename = 'gradematch.jpg') {
     anchor.click();
   } finally {
     anchor.remove();
-    // Safari needs the URL to survive beyond the initiating event loop turn.
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 }
