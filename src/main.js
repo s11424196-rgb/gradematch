@@ -1,5 +1,6 @@
 import { DEFAULT_SETTINGS, estimateSettings, generateCube } from './color.js';
 import { downloadBlob, exportJpeg, loadPhoto, renderPhoto, samplePhoto } from './imaging.js';
+import { renderGPU } from './webgl.js';
 import { icon } from './icons.js';
 
 const app = document.querySelector('#app');
@@ -35,6 +36,7 @@ const settingGroups = [
   { title: 'Colour', icon: 'palette', keys: ['temperature', 'tint', 'saturation'] },
   { title: 'Blend', icon: 'sliders', keys: ['strength'] },
 ];
+
 const controlMeta = {
   exposure: { label: 'Exposure', min: -3, max: 3, step: .01, digits: 2 },
   contrast: { label: 'Contrast', min: -100, max: 100, step: 1 },
@@ -83,13 +85,16 @@ function drawOriginal(canvas, photo) {
   context.drawImage(photo.image, 0, 0, canvas.width, canvas.height);
 }
 
-function updatePreview() {
+function updatePreview(redrawBase = false) {
   if (!state.target) return;
   const original = document.querySelector('#original');
   const graded = document.querySelector('#graded');
   try {
-    drawOriginal(original, state.target);
-    renderPhoto(graded, state.target, state.settings, 1400);
+    if (redrawBase) drawOriginal(original, state.target);
+    const success = renderGPU(graded, state.target, state.settings, 1400);
+    if (!success) {
+      renderPhoto(graded, state.target, state.settings, 1400);
+    }
     graded.style.clipPath = state.view === 'split' ? `inset(0 0 0 ${state.divider}%)` : '';
     const preview = document.querySelector('#preview-image');
     if (preview) preview.classList.toggle('after-only', state.view === 'after');
@@ -146,23 +151,26 @@ function bindEvents() {
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
     state.view = button.dataset.view;
     document.querySelectorAll('[data-view]').forEach(item => item.classList.toggle('active', item.dataset.view === state.view));
-    updatePreview();
+    updatePreview(false);
   }));
   document.querySelector('#divider')?.addEventListener('input', event => {
     state.divider = Number(event.target.value);
-    updatePreview();
+    const graded = document.querySelector('#graded');
+    const divider = document.querySelector('.gm-divider');
+    if (graded && state.view === 'split') graded.style.clipPath = `inset(0 0 0 ${state.divider}%)`;
+    if (divider) divider.style.left = `${state.divider}%`;
   });
   document.querySelectorAll('[data-setting]').forEach(input => input.addEventListener('input', event => {
     state.settings[event.target.dataset.setting] = Number(event.target.value);
     const output = document.querySelector(`#${event.target.dataset.setting}-value`);
     if (output) output.textContent = formatValue(event.target.dataset.setting, state.settings[event.target.dataset.setting]);
-    updatePreview();
+    updatePreview(false);
   }));
   document.querySelector('#skin-protection')?.addEventListener('change', event => {
     state.settings.skinProtection = event.target.checked;
     const label = event.target.closest('.gm-check-row')?.querySelector('.gm-value');
     if (label) label.textContent = state.settings.skinProtection ? 'ON' : 'OFF';
-    updatePreview();
+    updatePreview(false);
   });
   document.querySelector('#match-button')?.addEventListener('click', () => void matchPhotos());
   document.querySelector('#reset-button')?.addEventListener('click', resetMatch);
@@ -179,11 +187,15 @@ async function loadUploaded(kind, file) {
   state.error = '';
   try {
     const photo = await loadPhoto(file);
+    if (state[kind]) {
+      if (state[kind].url?.startsWith('blob:')) URL.revokeObjectURL(state[kind].url);
+      state[kind].image?.close?.();
+    }
     state[kind] = photo;
     state.status = state.reference && state.target ? 'Ready to match' : 'Add both photos to begin';
     shell();
     bindEvents();
-    updatePreview();
+    updatePreview(true);
     showToast(`${kind === 'reference' ? 'Reference' : 'Target'} photo loaded locally.`);
   } catch (error) {
     state.error = error.message;
@@ -209,7 +221,7 @@ function matchPhotos() {
     if (statusNode) statusNode.textContent = state.status;
     document.querySelector('.gm-match-dot')?.classList.add('is-ready');
     updateControlValues();
-    updatePreview();
+    updatePreview(true);
     showToast('Look matched. Fine-tune any control below.');
   } catch (error) {
     state.error = error.message;
@@ -224,7 +236,7 @@ function matchPhotos() {
 function resetMatch() {
   state.settings = clone(state.extractedSettings);
   updateControlValues();
-  updatePreview();
+  updatePreview(false);
   showToast('Reset to the extracted match.');
 }
 
