@@ -9,10 +9,25 @@ const clamp = (n, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, n));
 const finite = (n, fallback = 0) => Number.isFinite(n) ? n : fallback;
 const PERCENTILES = [0.5, 10, 25, 75, 90, 99.5];
 const TONE_KEYS = ['exposure', 'contrast', 'highlights', 'shadows', 'whites', 'blacks'];
-const decode = n => n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
-const encode = n => n <= 0.0031308 ? 12.92 * n : 1.055 * n ** (1 / 2.4) - 0.055;
+
+const decode = n => {
+  n = clamp(n, 0, 1);
+  return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
+};
+const encode = n => {
+  n = clamp(n, 0, 1);
+  return n <= 0.0031308 ? 12.92 * n : 1.055 * n ** (1 / 2.4) - 0.055;
+};
+
+// Precompute sRGB [0..255] -> Linear [0..1] table for high-speed pixel transformation
+const SRGB_TO_LINEAR = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  SRGB_TO_LINEAR[i] = decode(i / 255);
+}
+
 const labF = n => n > 216 / 24389 ? Math.cbrt(n) : n * 841 / 108 + 4 / 29;
 const labInv = n => n > 6 / 29 ? n ** 3 : (n - 4 / 29) * 108 / 841;
+const pow8 = x => { const x2 = x * x; const x4 = x2 * x2; return x4 * x4; };
 
 function normalize(settings = {}) {
   const out = { ...DEFAULT_SETTINGS };
@@ -29,10 +44,13 @@ function normalize(settings = {}) {
 }
 
 function toLab(r, g, b) {
-  r = decode(r / 255); g = decode(g / 255); b = decode(b / 255);
-  const x = labF((0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047);
-  const y = labF(0.2126729 * r + 0.7151522 * g + 0.072175 * b);
-  const z = labF((0.0193339 * r + 0.119192 * g + 0.9503041 * b) / 1.08883);
+  const lr = r >= 0 && r <= 255 && Number.isInteger(r) ? SRGB_TO_LINEAR[r] : decode(r / 255);
+  const lg = g >= 0 && g <= 255 && Number.isInteger(g) ? SRGB_TO_LINEAR[g] : decode(g / 255);
+  const lb = b >= 0 && b <= 255 && Number.isInteger(b) ? SRGB_TO_LINEAR[b] : decode(b / 255);
+
+  const x = labF((0.4124564 * lr + 0.3575761 * lg + 0.1804375 * lb) / 0.95047);
+  const y = labF(0.2126729 * lr + 0.7151522 * lg + 0.072175 * lb);
+  const z = labF((0.0193339 * lr + 0.119192 * lg + 0.9503041 * lb) / 1.08883);
   return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
 }
 
@@ -42,22 +60,30 @@ function fromLab(l, a, b) {
   const y = labInv(fy);
   const z = 1.08883 * labInv(fy - b / 200);
   return [
-    3.2404542 * x - 1.5371385 * y - 0.4985314 * z,
-    -0.969266 * x + 1.8760108 * y + 0.041556 * z,
-    0.0556434 * x - 0.2040259 * y + 1.0572252 * z,
-  ].map(n => 255 * clamp(encode(n)));
+    255 * clamp(encode(3.2404542 * x - 1.5371385 * y - 0.4985314 * z)),
+    255 * clamp(encode(-0.969266 * x + 1.8760108 * y + 0.041556 * z)),
+    255 * clamp(encode(0.0556434 * x - 0.2040259 * y + 1.0572252 * z)),
+  ];
 }
 
-function tone(l, s) {
-  // Exposure is measured in linear-light stops, before perceptual tone shaping.
-  const exposed = clamp(116 * labF(labInv((l + 16) / 116) * 2 ** s.exposure) - 16, 0, 100);
-  const t = exposed / 100;
+function tone(l, s, expScale = 2 ** s.exposure) {
+  const exposed = clamp(116 * labF(labInv((l + 16) / 116) * expScale) - 16, 0, 100);
+  const t = exposed * 0.01;
   const low = 1 - t;
-  return clamp(exposed + s.contrast * (t - 0.5) * 0.6
-    + s.highlights * 0.32 * t * t
-    + s.shadows * 0.32 * low * low
-    + s.whites * 0.22 * t ** 8
-    + s.blacks * 0.22 * low ** 8, 0, 100);
+
+  // Localized shadow/highlight weights that also allow lifting pure black (t = 0)
+  const shadowWeight = (0.25 + 0.75 * t) * (low * low) * 3.2;
+  const highlightWeight = (0.25 + 0.75 * low) * (t * t) * 3.2;
+
+  return clamp(
+    exposed
+    + s.contrast * (t - 0.5) * 0.6
+    + s.highlights * 0.32 * highlightWeight
+    + s.shadows * 0.32 * shadowWeight
+    + s.whites * 0.22 * pow8(t)
+    + s.blacks * 0.22 * pow8(low),
+    0, 100
+  );
 }
 
 function skinWeight(r, g, b) {
@@ -66,20 +92,32 @@ function skinWeight(r, g, b) {
   let hue = max === r ? (g - b) / d : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
   hue = (hue * 60 + 360) % 360;
   const distance = Math.min(Math.abs(hue - 28), 360 - Math.abs(hue - 28));
-  // Broad red/orange hue mask, feathered by saturation and brightness.
   return clamp(1 - distance / 35) * clamp((d / max - 0.06) / 0.2) * clamp(max / 45);
 }
 
 function transform(r, g, b, s) {
   r = clamp(finite(r), 0, 255); g = clamp(finite(g), 0, 255); b = clamp(finite(b), 0, 255);
   if (!s.strength || [...TONE_KEYS, 'temperature', 'tint', 'saturation'].every(key => s[key] === 0)) return [r, g, b];
+
   const [l, a, labB] = toLab(r, g, b);
   const protection = s.skinProtection ? 1 - skinWeight(r, g, b) * s.skinStrength / 100 : 1;
   const saturation = 1 + s.saturation / 100 * protection;
-  const adjusted = fromLab(tone(l, s), a * saturation + s.tint * 0.18 * protection,
-    labB * saturation + s.temperature * 0.22 * protection);
+
+  const newL = tone(l, s);
+
+  // Safe polynomial taper near absolute black (0) and white (100) — never produces NaN
+  const lNorm = clamp(l * 0.01, 0, 1);
+  const lFactor = 0.25 + 0.75 * (4 * lNorm * (1 - lNorm));
+  const targetA = a * saturation + s.tint * 0.18 * protection * lFactor;
+  const targetB = labB * saturation + s.temperature * 0.22 * protection * lFactor;
+
+  const adjusted = fromLab(newL, targetA, targetB);
   const amount = s.strength / 100;
-  return adjusted.map((n, i) => clamp([r, g, b][i] + (n - [r, g, b][i]) * amount, 0, 255));
+  return [
+    clamp(r + (adjusted[0] - r) * amount, 0, 255),
+    clamp(g + (adjusted[1] - g) * amount, 0, 255),
+    clamp(b + (adjusted[2] - b) * amount, 0, 255),
+  ];
 }
 
 /** Input and output channels are sRGB values in [0,255] (not necessarily integers). */
@@ -128,21 +166,29 @@ function collect(image, options) {
     }
     selected.push(sample);
   }
-  // Filtering should never turn a constant/clipped image into an invalid fit.
   const samples = selected.length ? selected : all;
   const luminance = samples.map(s => s.lab[0]).sort((a, b) => a - b);
   const meanLab = [0, 0, 0];
-  let averageSaturation = 0, averageChroma = 0;
+  let averageSaturation = 0;
   for (const s of samples) {
-    for (let c = 0; c < 3; c++) meanLab[c] += s.lab[c];
+    meanLab[0] += s.lab[0];
+    meanLab[1] += s.lab[1];
+    meanLab[2] += s.lab[2];
     averageSaturation += s.saturation;
-    averageChroma += Math.hypot(s.lab[1], s.lab[2]);
   }
   const n = samples.length || 1;
+  meanLab[0] /= n; meanLab[1] /= n; meanLab[2] /= n;
+
+  // Measure chroma spread relative to mean (a*, b*) to avoid cast cross-contamination
+  let averageChroma = 0;
+  for (const s of samples) {
+    averageChroma += Math.hypot(s.lab[1] - meanLab[1], s.lab[2] - meanLab[2]);
+  }
+
   return {
     sampleCount: samples.length,
     percentiles: Object.fromEntries(PERCENTILES.map(p => [p, quantile(luminance, p)])),
-    meanLab: meanLab.map(v => v / n), averageSaturation: averageSaturation / n,
+    meanLab, averageSaturation: averageSaturation / n,
     averageChroma: averageChroma / n,
   };
 }
@@ -157,11 +203,12 @@ export function estimateSettings(referenceImageData, targetImageData, options = 
     const source = PERCENTILES.map(p => target.percentiles[p]);
     const desired = PERCENTILES.map(p => reference.percentiles[p]);
     const spread = source[5] - source[0];
-    // A constant source has no contrast distribution to fit. Use only exposure
-    // and a shadow offset, which also permits lifting a completely black image.
     const keys = spread < 0.1 ? ['exposure', 'shadows'] : TONE_KEYS;
-    const loss = candidate => source.reduce((sum, l, i) => sum + (tone(l, candidate) - desired[i]) ** 2, 0)
-      + TONE_KEYS.reduce((sum, key) => sum + (candidate[key] / (key === 'exposure' ? 0.03 : 1)) ** 2 * 0.002, 0);
+    const loss = candidate => {
+      const expScale = 2 ** candidate.exposure;
+      return source.reduce((sum, l, i) => sum + (tone(l, candidate, expScale) - desired[i]) ** 2, 0)
+        + TONE_KEYS.reduce((sum, key) => sum + (candidate[key] / (key === 'exposure' ? 0.03 : 1)) ** 2 * 0.002, 0);
+    };
     let best = loss(settings);
     for (let step = 16; step >= 0.0625; step /= 2) {
       for (let pass = 0; pass < 32; pass++) {
